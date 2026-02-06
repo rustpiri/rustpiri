@@ -1,0 +1,105 @@
+steg 1  Get the write-back group (sync01)
+
+
+$Group = Get-ADGroup -Identity "<GroupName>"
+
+
+Step 2: Remove “Write Members” for Domain Admins
+
+# Remove Write Members for Domain Admins
+$DomainAdmins = Get-ADGroup -Identity "Domain Admins"
+$acl = Get-ACL "AD:$($Group.DistinguishedName)"
+$rule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+    $DomainAdmins.SID,
+    "WriteProperty",
+    "Deny",
+    [Guid]"bf9679c0-0de6-11d0-a285-00aa003049e2", # GUID for 'member' attribute
+    "All"
+)
+$acl.AddAccessRule($rule)
+Set-ACL -ACLObject $acl -Path "AD:$($Group.DistinguishedName)"
+
+
+
+
+
+
+###########Script — Deny “Write Members” for Domain Admins in a single OU
+
+# Requires RSAT / ActiveDirectory module
+Import-Module ActiveDirectory
+
+# =========================
+# CONFIGURE THESE VALUES
+# =========================
+$TargetOU      = "OU=WriteBackGroups,DC=soderbergpartners,DC=local"  # <-- your OU DN
+$DenyPrincipal = "Domain Admins"                                    # principal to deny
+$DryRun        = $false                                             # set $true to preview only
+
+# member attribute GUID (WriteProperty on 'member')
+$MemberAttrGuid = [Guid]"bf9679c0-0de6-11d0-a285-00aa003049e2"
+
+# Resolve principal once
+try {
+    $DenyGroup = Get-ADGroup -Identity $DenyPrincipal -ErrorAction Stop
+} catch {
+    Write-Error "Could not resolve deny principal '$DenyPrincipal'. $_"
+    return
+}
+
+# Collect all groups in the OU
+try {
+    $Groups = Get-ADGroup -SearchBase $TargetOU -LDAPFilter "(objectClass=group)" -Properties Name, DistinguishedName
+} catch {
+    Write-Error "Failed to enumerate groups under OU '$TargetOU'. $_"
+    return
+}
+
+if (-not $Groups) {
+    Write-Warning "No groups found under OU '$TargetOU'. Nothing to do."
+    return
+}
+
+Write-Host "Found $($Groups.Count) groups under $TargetOU" -ForegroundColor Cyan
+
+# Prepare backup folder
+$BackupRoot = "C:\ACL_Backup"
+New-Item -ItemType Directory -Path $BackupRoot -ErrorAction SilentlyContinue | Out-Null
+
+foreach ($Group in $Groups) {
+    try {
+        Write-Host "Processing: $($Group.Name)" -ForegroundColor Yellow
+
+        # Read current ACL
+        $pathAD = "AD:$($Group.DistinguishedName)"
+        $aclCurrent = Get-ACL $pathAD
+
+        # Backup
+        $backupFile = Join-Path $BackupRoot "$($Group.Name)_acl.xml"
+        $aclCurrent | Export-Clixml $backupFile
+        Write-Host "  - ACL backup: $backupFile" -ForegroundColor DarkCyan
+
+        # Build the deny ACE
+        $denyRule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+            $DenyGroup.SID, "WriteProperty", "Deny", $MemberAttrGuid, "All"
+        )
+
+        if ($DryRun) {
+            Write-Host "  - DRY-RUN: Would add Deny WriteProperty(member) for '$DenyPrincipal'" -ForegroundColor Magenta
+            continue
+        }
+
+        # Apply the deny ACE
+        $aclNew = $aclCurrent
+        $aclNew.AddAccessRule($denyRule)
+
+        Set-ACL -ACLObject $aclNew -Path $pathAD
+        Write-Host "  - Applied Deny rule (member attribute) to $($Group.Name)" -ForegroundColor Green
+
+    } catch {
+        Write-Warning "  ! Failed for $($Group.Name): $($_.Exception.Message)"
+        continue
+    }
+}
+
+Write-Host "Done." -ForegroundColor Cyan
